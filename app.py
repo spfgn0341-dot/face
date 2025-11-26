@@ -2,47 +2,63 @@ import streamlit as st
 import cv2
 import numpy as np
 import os
+import shutil
 import scipy.stats
 
 # ==========================================
-# 1. 依存ライブラリの強制パッチ処理 (最優先)
+# 0. 初期設定とパッチ処理（最優先実行）
 # ==========================================
 
-# 【Scipyエラー回避】
+# ------------------------------------------
+# A. Scipyエラー回避
+# ------------------------------------------
 # scipy 1.12以降で削除された binom_test を binomtest に置き換えます
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
 
-# 【PermissionError回避 (重要)】
-# ここで py-feat のモジュールをインポートし、保存先関数を書き換えます
+# ------------------------------------------
+# B. パスと設定ファイルの修復 (FileNotFoundError & PermissionError対策)
+# ------------------------------------------
+import feat
 import feat.utils
 import feat.pretrained
 
-# 書き込み可能なディレクトリ（現在のフォルダ/model_weights）を指定
+# 1. 書き込み可能なローカルディレクトリを作成
 writable_dir = os.path.join(os.getcwd(), 'model_weights')
 os.makedirs(writable_dir, exist_ok=True)
 
+# 2. オリジナルのインストール先から model_list.json を探し出し、ローカルにコピーする
+#    (これをしないと Detector() が設定ファイルを見つけられず落ちる)
+original_feat_dir = os.path.dirname(feat.__file__) # site-packages/feat
+original_resources_dir = os.path.join(original_feat_dir, 'resources')
+json_filename = 'model_list.json'
+
+src_json_path = os.path.join(original_resources_dir, json_filename)
+dst_json_path = os.path.join(writable_dir, json_filename)
+
+# コピー実行（まだローカルになければ）
+if os.path.exists(src_json_path) and not os.path.exists(dst_json_path):
+    shutil.copy(src_json_path, dst_json_path)
+
+# 3. パッチ適用: py-feat が参照するパスを、準備したローカルフォルダに向ける
 def patched_get_resource_path():
-    """モデル保存先を書き込み可能なローカルフォルダに向ける関数"""
     return writable_dir
 
-# feat.utils と feat.pretrained の両方の関数を書き換える
 feat.utils.get_resource_path = patched_get_resource_path
 feat.pretrained.get_resource_path = patched_get_resource_path
 
 # ==========================================
-# 2. アプリ本体の処理
+# アプリ本体
 # ==========================================
 
-# パッチを当てた後に Detector をインポート
 from feat import Detector
 from PIL import Image
 
 # モデルのロードをキャッシュ
 @st.cache_resource
 def load_detector():
-    # 引数は空にする（デフォルトモデルを使用）
-    # パッチのおかげで、writable_dir にモデルがダウンロードされます
+    # 引数は空（デフォルト設定）
+    # パッチのおかげで、ローカルフォルダの設定ファイルを読み、ローカルにモデルをDLします
     return Detector()
 
 def annotate_image(img_array, results):
@@ -50,7 +66,6 @@ def annotate_image(img_array, results):
     emotion_cols = ['anger', 'disgust', 'fear', 'happiness', 'sadness', 'surprise', 'neutral']
 
     for index, row in results.iterrows():
-        # 座標取得
         x = int(row['FaceRectX'])
         y = int(row['FaceRectY'])
         w = int(row['FaceRectWidth'])
@@ -62,11 +77,11 @@ def annotate_image(img_array, results):
         emotion_texts = []
         for emo in emotion_cols:
             if emo in row:
-                if row[emo] > 0.05: # 表示閾値
+                if row[emo] > 0.05:
                     emotion_texts.append(f"{emo}: {row[emo]:.2f}")
 
         if emotion_texts:
-            text = ", ".join(emotion_texts[:2]) # 上位2つ
+            text = ", ".join(emotion_texts[:2])
         else:
             text = "Neutral"
             
@@ -86,9 +101,8 @@ if uploaded_file is not None:
     # RGB → BGR 変換
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    st.info("モデルをロード中...（初回はダウンロードに数分かかります）")
+    st.info("モデルを準備中...（初回のみダウンロードに数分かかります）")
     
-    # ここで load_detector が呼ばれる
     detector = load_detector()
 
     st.write("分析中...")
