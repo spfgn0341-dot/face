@@ -1,5 +1,5 @@
 streamlit
- py-feat
- opencv-python-headless
- pandas
- numpy
+py-feat
+opencv-python-headless
+pandas
+numpy
