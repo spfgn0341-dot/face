@@ -25,7 +25,6 @@ BASE_DIR = os.getcwd()
 MODEL_DIR = os.path.join(BASE_DIR, 'model_weights')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# 404だったURLを削除し、必要なものだけ残しました
 MODEL_URLS = {
     # 顔検出
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
@@ -46,20 +45,24 @@ def download_file(filename, url):
             st.error(f"必須ファイルのダウンロードに失敗しました: {filename}\n{e}")
             st.stop()
 
-# 【重要】不足している .npy ファイルをダミー生成する関数
-# これで「ファイルがない」「URLが404」の両方を解決します
+# 【修正】不足ファイルをまとめてダミー生成
 def create_dummy_files():
-    # 平均ポーズデータ: 使わないので適当なゼロ配列で作成
-    npy_path = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
-    if not os.path.exists(npy_path):
-        # 形状は適当ですが読み込みエラーさえ回避できればOK
-        dummy_data = np.zeros((3,), dtype=np.float32)
-        np.save(npy_path, dummy_data)
+    # 1. 平均値データ (前回エラー)
+    mean_npy = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
+    if not os.path.exists(mean_npy):
+        # 形状(3,)のゼロ配列
+        np.save(mean_npy, np.zeros((3,), dtype=np.float32))
+        
+    # 2. 標準偏差データ (今回エラー)
+    std_npy = os.path.join(MODEL_DIR, "WIDER_train_pose_stddev_v1.npy")
+    if not os.path.exists(std_npy):
+        # 形状(3,)の1埋め配列 (0割りを防ぐため念のため1に)
+        np.save(std_npy, np.ones((3,), dtype=np.float32))
 
 # 設定ファイル生成
 def create_model_config():
     config_path = os.path.join(MODEL_DIR, 'model_list.json')
-    dummy_file = "mobilenet0.25_Final.pth" # 存在するファイルを指しておく
+    dummy_file = "mobilenet0.25_Final.pth"
     
     config_data = {
         "face_detectors": {
@@ -94,33 +97,38 @@ def create_model_config():
         json.dump(config_data, f)
 
 # ==========================================
-# 3. Detector ローダー (最強パッチ適用版)
+# 3. Detector ローダー (Final Fix)
 # ==========================================
 
 @st.cache_resource
 def load_detector_safe():
     st.info("モデル環境を構築中...")
     
-    # 1. ファイル準備（ダウンロード ＆ ダミー生成）
+    # 1. 準備（ダウンロード ＆ ダミー生成）
     for fname, url in MODEL_URLS.items():
         download_file(fname, url)
-    create_dummy_files()  # <--- これで404エラーを回避
+    create_dummy_files()  # <--- ここで2つのダミーファイルを作成
     create_model_config()
     
     # 2. パス関数のパッチ
     def patched_get_resource_path():
         return MODEL_DIR
     
-    # 3. numpy.load のハイジャック（これが最後の砦）
-    # ライブラリが「システムパス」からファイルを読もうとしたら
-    # 「ローカルのダミーファイル」にすり替える
+    # 3. numpy.load のハイジャック
+    # ライブラリがハードコードされたパスを読もうとしたら
+    # モデルディレクトリ内のファイルを強制的に読ませる
     original_np_load = np.load
     
     def patched_np_load(file, *args, **kwargs):
-        if isinstance(file, str) and "WIDER_train_pose_mean_v1.npy" in file:
-            # 強制的に作成したダミーファイルを読み込ませる
-            new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
-            return original_np_load(new_path, *args, **kwargs)
+        if isinstance(file, str):
+            # 平均値 または 標準偏差ファイルの場合
+            if "WIDER_train_pose_mean_v1.npy" in file:
+                new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
+                return original_np_load(new_path, *args, **kwargs)
+            elif "WIDER_train_pose_stddev_v1.npy" in file:
+                new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_stddev_v1.npy")
+                return original_np_load(new_path, *args, **kwargs)
+                
         return original_np_load(file, *args, **kwargs)
     
     # パッチ適用
@@ -140,8 +148,6 @@ def load_detector_safe():
                 module.get_resource_path = patched_get_resource_path
 
         # 5. クラス無効化 (Mocking)
-        # AUとFacePoseはダミーファイルで読み込みは成功するが
-        # 実行時にエラーにならないようクラスごと無効化する
         class MockDetectorPart:
             def __init__(self, *args, **kwargs): pass
             def detect(self, *args, **kwargs): return None
@@ -161,7 +167,7 @@ def load_detector_safe():
         )
         
     finally:
-        # np.load を元に戻す（副作用防止）
+        # np.load を元に戻す
         np.load = original_np_load
 
     return detector
