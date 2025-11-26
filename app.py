@@ -19,7 +19,7 @@ if not hasattr(scipy.integrate, 'simps'):
     scipy.integrate.simps = scipy.integrate.simpson
 
 # ==========================================
-# 2. ファイルシステムとモデルの準備
+# 2. 環境構築
 # ==========================================
 BASE_DIR = os.getcwd()
 MODEL_DIR = os.path.join(BASE_DIR, 'model_weights')
@@ -32,14 +32,16 @@ REAL_MODELS = {
     "pfld_model_best.pth.tar": "https://huggingface.co/py-feat/pfld/resolve/main/pfld_model_best.pth.tar",
 }
 
-# 2. 偽装ファイル名 (AU, FacePose用)
-# 本物のファイルをここにコピーして、ライブラリを騙します
+# 2. 公式の設定ファイル (これをベースにするのでKeyErrorが起きない)
+OFFICIAL_CONFIG_URL = "https://github.com/cosanlab/py-feat/raw/main/feat/resources/model_list.json"
+
+# 3. 偽装ファイル (AU/Pose用)
 FAKE_FILES_MAP = {
-    "img2pose_v1.pth": "mobilenet0.25_Final.pth", # RetinaFaceのファイルをコピー
-    "svm_lenet_v1.pth": "mobilenet0.25_Final.pth" # 同上
+    "img2pose_v1.pth": "mobilenet0.25_Final.pth", 
+    "svm_lenet_v1.pth": "mobilenet0.25_Final.pth"
 }
 
-# 3. ダミー生成する .npy ファイル
+# 4. ダミー生成する .npy ファイル
 DUMMY_NPY_FILES = [
     "WIDER_train_pose_mean_v1.npy",
     "WIDER_train_pose_stddev_v1.npy",
@@ -48,9 +50,54 @@ DUMMY_NPY_FILES = [
 ]
 
 def prepare_environment():
-    """必要なファイルを全て揃える"""
+    """環境構築: 公式設定ファイルをDLし、ローカル向けに改造する"""
     
-    # A. 本物のダウンロード
+    # A. 公式の設定ファイルをダウンロード
+    config_path = os.path.join(MODEL_DIR, 'model_list.json')
+    if not os.path.exists(config_path) or os.path.getsize(config_path) < 100:
+        try:
+            req = urllib.request.Request(OFFICIAL_CONFIG_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(config_path, 'wb') as out_file:
+                shutil.copyfileobj(response, out_file)
+        except Exception:
+            # 万が一DLできなければ、最低限の構成で作る（前の反省を生かし net_name を追加）
+            with open(config_path, 'w') as f:
+                json.dump({
+                    "face_detectors": {"retinaface": {"file": "mobilenet0.25_Final.pth", "net_name": "mobilenet0.25"}},
+                    "landmark_detectors": {"pfld": {"file": "pfld_model_best.pth.tar"}},
+                    "emotion_detectors": {"resmasknet": {"file": "ResMaskNet_Z_resmasking_dropout1_rot30.pth"}},
+                    "au_detectors": {"svm": {"file": "svm_lenet_v1.pth"}},
+                    "facepose_detectors": {"img2pose": {"file": "img2pose_v1.pth"}}
+                }, f)
+
+    # B. 設定ファイルの読み込みと改造 (パスをローカルに向ける)
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # 全てのモデル定義の 'file' を、ファイル名だけ（ローカルパス）にする
+        # これにより、ライブラリが余計なパスを探さなくなる
+        for category in config.values():
+            for model_name, settings in category.items():
+                if 'file' in settings:
+                    settings['file'] = os.path.basename(settings['file'])
+                # ハッシュチェックをスキップ
+                settings['sha256'] = 'skip'
+        
+        # 偽装したいモデルの設定を上書き (ファイル名を偽装ファイルに向ける)
+        if "au_detectors" in config and "svm" in config["au_detectors"]:
+            config["au_detectors"]["svm"]["file"] = "svm_lenet_v1.pth"
+        if "facepose_detectors" in config and "img2pose" in config["facepose_detectors"]:
+            config["facepose_detectors"]["img2pose"]["file"] = "img2pose_v1.pth"
+
+        # 保存
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+            
+    except Exception as e:
+        st.error(f"設定ファイルの調整に失敗: {e}")
+
+    # C. モデルファイルのダウンロード
     for fname, url in REAL_MODELS.items():
         path = os.path.join(MODEL_DIR, fname)
         if not os.path.exists(path) or os.path.getsize(path) < 1000:
@@ -59,10 +106,9 @@ def prepare_environment():
                 with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
                     shutil.copyfileobj(response, out_file)
             except Exception:
-                pass # エラーでも進む（次の偽装工程でなんとかなる場合があるため）
+                pass
 
-    # B. 偽装ファイルの作成 (コピー)
-    # 正常なファイル(mobilenet)をコピーして、足りないファイルになりすます
+    # D. 偽装ファイルの作成 (コピー)
     source_path = os.path.join(MODEL_DIR, "mobilenet0.25_Final.pth")
     if os.path.exists(source_path):
         for fake_name, _ in FAKE_FILES_MAP.items():
@@ -70,70 +116,22 @@ def prepare_environment():
             if not os.path.exists(fake_path):
                 shutil.copy(source_path, fake_path)
 
-    # C. .npy ダミー生成
+    # E. .npy ダミー生成
     for npy_name in DUMMY_NPY_FILES:
         path = os.path.join(MODEL_DIR, npy_name)
         if not os.path.exists(path):
             shape = (68, 3) if "68" in npy_name else (3,)
-            # ゼロ除算回避のため全て1で埋める
             np.save(path, np.ones(shape, dtype=np.float32))
-
-    # D. 【重要】設定ファイル(model_list.json)の生成
-    # これがないと FileNotFoundError になります
-    create_model_config()
-
-def create_model_config():
-    config_path = os.path.join(MODEL_DIR, 'model_list.json')
-    
-    config_data = {
-        "face_detectors": {
-            "retinaface": {
-                "file": "mobilenet0.25_Final.pth",
-                "urls": [REAL_MODELS["mobilenet0.25_Final.pth"]],
-                "sha256": "skip"
-            }
-        },
-        "landmark_detectors": {
-            "pfld": {
-                "file": "pfld_model_best.pth.tar",
-                "urls": [REAL_MODELS["pfld_model_best.pth.tar"]],
-                "sha256": "skip"
-            }
-        },
-        "emotion_detectors": {
-            "resmasknet": {
-                "file": "ResMaskNet_Z_resmasking_dropout1_rot30.pth",
-                "urls": [REAL_MODELS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"]],
-                "sha256": "skip"
-            }
-        },
-        "au_detectors": {
-            "svm": { # Detectorには "svm" を指定する
-                "file": "svm_lenet_v1.pth", # 偽装ファイル
-                "urls": [],
-                "sha256": "skip"
-            }
-        },
-        "facepose_detectors": {
-            "img2pose": { # Detectorには "img2pose" を指定する
-                "file": "img2pose_v1.pth", # 偽装ファイル
-                "urls": [],
-                "sha256": "skip"
-            }
-        }
-    }
-    with open(config_path, 'w') as f:
-        json.dump(config_data, f)
 
 # ==========================================
 # 3. Detector ローダー
 # ==========================================
 
 @st.cache_resource
-def load_detector_final():
-    st.info("システムの構築とロード中...")
+def load_detector_ultimate_v2():
+    st.info("システム初期化中...")
     
-    # 1. 環境構築 (ここで json も生成される)
+    # 1. 環境構築 (公式JSONベース)
     prepare_environment()
     
     # 2. パス関数の定義
@@ -166,7 +164,7 @@ def load_detector_final():
                 module.get_resource_path = patched_get_resource_path
 
         # 6. クラスの無効化 (Mocking)
-        # 偽装ファイルの中身はめちゃくちゃなので、クラスごと無効化して実行を防ぐ
+        # 偽装ファイルを実行させないための空クラス
         class MockDetectorPart:
             def __init__(self, *args, **kwargs):
                 pass
@@ -179,7 +177,7 @@ def load_detector_final():
         from feat import Detector
         
         # 7. 初期化
-        # ファイルはある。設定もある。読み込みはMockがスルーする。
+        # 公式JSONを使っているので、RetinaFaceのキー不足エラーは起きないはずです。
         detector = Detector(
             face_model="retinaface",
             landmark_model="pfld",
@@ -235,7 +233,7 @@ if uploaded_file is not None:
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
     try:
-        detector = load_detector_final()
+        detector = load_detector_ultimate_v2()
     except Exception as e:
         st.error(f"起動エラー: {e}")
         st.stop()
