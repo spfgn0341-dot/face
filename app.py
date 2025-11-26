@@ -5,7 +5,7 @@ import os
 import scipy.stats
 
 # ==========================================
-# 1. エラー回避のためのパッチ処理（重要）
+# 1. 依存ライブラリの強制パッチ処理 (最優先)
 # ==========================================
 
 # 【Scipyエラー回避】
@@ -13,31 +13,36 @@ import scipy.stats
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
 
-# 【PermissionError回避】
-# py-featがモデルを保存する先を、書き込み可能なローカルフォルダに変更します
+# 【PermissionError回避 (重要)】
+# ここで py-feat のモジュールをインポートし、保存先関数を書き換えます
 import feat.utils
+import feat.pretrained
+
+# 書き込み可能なディレクトリ（現在のフォルダ/model_weights）を指定
+writable_dir = os.path.join(os.getcwd(), 'model_weights')
+os.makedirs(writable_dir, exist_ok=True)
 
 def patched_get_resource_path():
-    # アプリと同じ階層に 'model_weights' というフォルダを作り、そこを保存先に指定
-    save_dir = os.path.join(os.getcwd(), 'model_weights')
-    os.makedirs(save_dir, exist_ok=True)
-    return save_dir
+    """モデル保存先を書き込み可能なローカルフォルダに向ける関数"""
+    return writable_dir
 
-# py-feat内部のパス取得関数を、自作の関数に置き換え（モンキーパッチ）
+# feat.utils と feat.pretrained の両方の関数を書き換える
 feat.utils.get_resource_path = patched_get_resource_path
+feat.pretrained.get_resource_path = patched_get_resource_path
 
 # ==========================================
 # 2. アプリ本体の処理
 # ==========================================
 
+# パッチを当てた後に Detector をインポート
 from feat import Detector
 from PIL import Image
 
 # モデルのロードをキャッシュ
 @st.cache_resource
 def load_detector():
-    # 引数は空にする（probability=True は削除済み）
-    # パッチを当てたので、モデルは 'model_weights' フォルダにダウンロードされます
+    # 引数は空にする（デフォルトモデルを使用）
+    # パッチのおかげで、writable_dir にモデルがダウンロードされます
     return Detector()
 
 def annotate_image(img_array, results):
@@ -45,22 +50,23 @@ def annotate_image(img_array, results):
     emotion_cols = ['anger', 'disgust', 'fear', 'happiness', 'sadness', 'surprise', 'neutral']
 
     for index, row in results.iterrows():
+        # 座標取得
         x = int(row['FaceRectX'])
         y = int(row['FaceRectY'])
         w = int(row['FaceRectWidth'])
         h = int(row['FaceRectHeight'])
 
-        # 顔の矩形描画
+        # 矩形描画
         cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
         emotion_texts = []
         for emo in emotion_cols:
             if emo in row:
-                if row[emo] > 0.05: # 数値が見やすいように閾値を設定
+                if row[emo] > 0.05: # 表示閾値
                     emotion_texts.append(f"{emo}: {row[emo]:.2f}")
 
         if emotion_texts:
-            text = ", ".join(emotion_texts[:2]) # 上位2つを表示
+            text = ", ".join(emotion_texts[:2]) # 上位2つ
         else:
             text = "Neutral"
             
@@ -77,12 +83,12 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file)
     img_array = np.array(image)
 
-    # RGB → BGR 変換（OpenCV用）
+    # RGB → BGR 変換
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    st.write("モデルをロード中...（初回は数分かかる場合があります）")
+    st.info("モデルをロード中...（初回はダウンロードに数分かかります）")
     
-    # ここで load_detector が呼ばれ、モデルのダウンロードが始まります
+    # ここで load_detector が呼ばれる
     detector = load_detector()
 
     st.write("分析中...")
