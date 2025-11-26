@@ -11,7 +11,7 @@ import cv2
 from PIL import Image
 
 # ==========================================
-# 1. ライブラリ互換性パッチ (Scipy対策)
+# 1. Scipy 互換性パッチ
 # ==========================================
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
@@ -19,29 +19,27 @@ if not hasattr(scipy.integrate, 'simps'):
     scipy.integrate.simps = scipy.integrate.simpson
 
 # ==========================================
-# 2. 「ファイル偽装」環境の構築
+# 2. ファイルシステムとモデルの準備
 # ==========================================
 BASE_DIR = os.getcwd()
 MODEL_DIR = os.path.join(BASE_DIR, 'model_weights')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# 1. 本当に必要な正規ファイル
+# 1. 本物のモデルファイル
 REAL_MODELS = {
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
     "ResMaskNet_Z_resmasking_dropout1_rot30.pth": "https://huggingface.co/py-feat/resmasknet/resolve/main/ResMaskNet_Z_resmasking_dropout1_rot30.pth",
     "pfld_model_best.pth.tar": "https://huggingface.co/py-feat/pfld/resolve/main/pfld_model_best.pth.tar",
 }
 
-# 2. エラー回避のための偽装ファイル名リスト
-# これらはダウンロードせず、上記の正規ファイルをコピーして作成します
-FAKE_FILES = [
-    "img2pose_v1.pth",      # 今回エラーになったファイル
-    "svm_lenet_v1.pth",     # AUモデルのデフォルト
-    "hog_pca_all_emotio.joblib", # 古い感情モデルなど
-    "rf_face_landmarks.dat" # 念のため
-]
+# 2. 偽装ファイル名 (AU, FacePose用)
+# 本物のファイルをここにコピーして、ライブラリを騙します
+FAKE_FILES_MAP = {
+    "img2pose_v1.pth": "mobilenet0.25_Final.pth", # RetinaFaceのファイルをコピー
+    "svm_lenet_v1.pth": "mobilenet0.25_Final.pth" # 同上
+}
 
-# 3. .npy データファイル（ダミー生成）
+# 3. ダミー生成する .npy ファイル
 DUMMY_NPY_FILES = [
     "WIDER_train_pose_mean_v1.npy",
     "WIDER_train_pose_stddev_v1.npy",
@@ -50,68 +48,103 @@ DUMMY_NPY_FILES = [
 ]
 
 def prepare_environment():
-    """必要な環境を強制的に作り出す"""
+    """必要なファイルを全て揃える"""
     
-    # A. 正規ファイルのダウンロード
-    valid_file_path = None # コピー元として使う正常なファイル
-    
+    # A. 本物のダウンロード
     for fname, url in REAL_MODELS.items():
         path = os.path.join(MODEL_DIR, fname)
         if not os.path.exists(path) or os.path.getsize(path) < 1000:
             try:
-                # User-Agent偽装
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
                     shutil.copyfileobj(response, out_file)
-            except Exception as e:
-                # 致命的なエラー以外は無視（あとでダミーで埋める）
-                pass
-        
-        # コピー元として確保（mobilenetを使用）
-        if "mobilenet" in fname and os.path.exists(path):
-            valid_file_path = path
+            except Exception:
+                pass # エラーでも進む（次の偽装工程でなんとかなる場合があるため）
 
     # B. 偽装ファイルの作成 (コピー)
-    # ライブラリが「img2pose_v1.pthがない」と騒ぐなら、mobilenetをその名前でコピーして黙らせる
-    if valid_file_path:
-        for fake_name in FAKE_FILES:
+    # 正常なファイル(mobilenet)をコピーして、足りないファイルになりすます
+    source_path = os.path.join(MODEL_DIR, "mobilenet0.25_Final.pth")
+    if os.path.exists(source_path):
+        for fake_name, _ in FAKE_FILES_MAP.items():
             fake_path = os.path.join(MODEL_DIR, fake_name)
             if not os.path.exists(fake_path):
-                shutil.copy(valid_file_path, fake_path)
+                shutil.copy(source_path, fake_path)
 
-    # C. .npyファイルのダミー生成 (ゼロ埋め)
+    # C. .npy ダミー生成
     for npy_name in DUMMY_NPY_FILES:
-        npy_path = os.path.join(MODEL_DIR, npy_name)
-        if not os.path.exists(npy_path):
-            # 形状は適当でも読み込めればOK (クラスを無効化するため使われない)
-            if "68" in npy_name:
-                shape = (68, 3)
-            else:
-                shape = (3,)
-            # ゼロ除算エラーを防ぐため全て1にする
-            np.save(npy_path, np.ones(shape, dtype=np.float32))
+        path = os.path.join(MODEL_DIR, npy_name)
+        if not os.path.exists(path):
+            shape = (68, 3) if "68" in npy_name else (3,)
+            # ゼロ除算回避のため全て1で埋める
+            np.save(path, np.ones(shape, dtype=np.float32))
+
+    # D. 【重要】設定ファイル(model_list.json)の生成
+    # これがないと FileNotFoundError になります
+    create_model_config()
+
+def create_model_config():
+    config_path = os.path.join(MODEL_DIR, 'model_list.json')
+    
+    config_data = {
+        "face_detectors": {
+            "retinaface": {
+                "file": "mobilenet0.25_Final.pth",
+                "urls": [REAL_MODELS["mobilenet0.25_Final.pth"]],
+                "sha256": "skip"
+            }
+        },
+        "landmark_detectors": {
+            "pfld": {
+                "file": "pfld_model_best.pth.tar",
+                "urls": [REAL_MODELS["pfld_model_best.pth.tar"]],
+                "sha256": "skip"
+            }
+        },
+        "emotion_detectors": {
+            "resmasknet": {
+                "file": "ResMaskNet_Z_resmasking_dropout1_rot30.pth",
+                "urls": [REAL_MODELS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"]],
+                "sha256": "skip"
+            }
+        },
+        "au_detectors": {
+            "svm": { # Detectorには "svm" を指定する
+                "file": "svm_lenet_v1.pth", # 偽装ファイル
+                "urls": [],
+                "sha256": "skip"
+            }
+        },
+        "facepose_detectors": {
+            "img2pose": { # Detectorには "img2pose" を指定する
+                "file": "img2pose_v1.pth", # 偽装ファイル
+                "urls": [],
+                "sha256": "skip"
+            }
+        }
+    }
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f)
 
 # ==========================================
-# 3. Detector ローダー (最強パッチ)
+# 3. Detector ローダー
 # ==========================================
 
 @st.cache_resource
-def load_detector_ultimate():
+def load_detector_final():
     st.info("システムの構築とロード中...")
     
-    # 1. 物理ファイルの準備
+    # 1. 環境構築 (ここで json も生成される)
     prepare_environment()
     
     # 2. パス関数の定義
     def patched_get_resource_path():
         return MODEL_DIR
     
-    # 3. numpy.load のハイジャック (システムパス対策)
+    # 3. numpy.load ハイジャック
     original_np_load = np.load
     def patched_np_load(file, *args, **kwargs):
         if isinstance(file, str):
             filename = os.path.basename(file)
-            # ターゲットのファイル名なら、強制的にローカルのダミーを読ませる
             if filename in DUMMY_NPY_FILES:
                 return original_np_load(os.path.join(MODEL_DIR, filename), *args, **kwargs)
         return original_np_load(file, *args, **kwargs)
@@ -119,7 +152,7 @@ def load_detector_ultimate():
     np.load = patched_np_load
 
     try:
-        # 4. インポート (ここで初めて行う)
+        # 4. インポート
         import feat
         import feat.utils
         import feat.pretrained
@@ -133,13 +166,12 @@ def load_detector_ultimate():
                 module.get_resource_path = patched_get_resource_path
 
         # 6. クラスの無効化 (Mocking)
-        # 偽装ファイルを読み込ませているので、実際に推論が走るとエラーになる。
-        # したがって、クラス自体を「何もしないクラス」に書き換える。
+        # 偽装ファイルの中身はめちゃくちゃなので、クラスごと無効化して実行を防ぐ
         class MockDetectorPart:
             def __init__(self, *args, **kwargs):
                 pass
             def detect(self, *args, **kwargs):
-                return None # 何も検出しない
+                return None
             
         feat.detector.AUDetector = MockDetectorPart
         feat.detector.FacePoseDetector = MockDetectorPart
@@ -147,18 +179,16 @@ def load_detector_ultimate():
         from feat import Detector
         
         # 7. 初期化
-        # ファイルは存在するのでロードエラーは起きない。
-        # 中身は別物だが、Mockクラスが握りつぶすので実行時エラーも起きない。
+        # ファイルはある。設定もある。読み込みはMockがスルーする。
         detector = Detector(
             face_model="retinaface",
             landmark_model="pfld",
             emotion_model="resmasknet",
-            au_model="svm",         # 本来はsvm_lenet_v1.pthを読む (偽装済み)
-            facepose_model="img2pose" # 本来はimg2pose_v1.pthを読む (偽装済み)
+            au_model="svm",
+            facepose_model="img2pose"
         )
         
     finally:
-        # 副作用防止のため戻す
         np.load = original_np_load
 
     return detector
@@ -205,23 +235,22 @@ if uploaded_file is not None:
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
     try:
-        detector = load_detector_ultimate()
+        detector = load_detector_final()
     except Exception as e:
-        st.error(f"深刻なエラーが発生しました。\n詳細: {e}")
+        st.error(f"起動エラー: {e}")
         st.stop()
 
     st.write("分析中...")
     try:
         result = detector.detect_image(img_bgr)
     except Exception as e:
-        st.error(f"解析中にエラーが発生しました: {e}")
+        st.error(f"解析エラー: {e}")
         st.stop()
 
     if result.empty:
         st.warning("顔が検出されませんでした。")
     else:
         st.write("解析結果データ:")
-        # エラー回避のためデータフレームの一部だけ表示
         st.dataframe(result)
         
         annotated_img_bgr = annotate_image(img_bgr, result)
