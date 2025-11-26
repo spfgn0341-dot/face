@@ -9,6 +9,7 @@ import scipy.integrate
 import numpy as np
 import cv2
 from PIL import Image
+import builtins
 
 # ==========================================
 # 1. Scipy 互換性パッチ
@@ -25,24 +26,35 @@ BASE_DIR = os.getcwd()
 MODEL_DIR = os.path.join(BASE_DIR, 'model_weights')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# 不足していた .npy ファイルを追加
 MODEL_URLS = {
+    # 顔検出
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
+    # 感情認識
     "ResMaskNet_Z_resmasking_dropout1_rot30.pth": "https://huggingface.co/py-feat/resmasknet/resolve/main/ResMaskNet_Z_resmasking_dropout1_rot30.pth",
+    # ランドマーク検出
     "pfld_model_best.pth.tar": "https://huggingface.co/py-feat/pfld/resolve/main/pfld_model_best.pth.tar",
+    # 【追加】今回エラーになったファイル (平均ポーズデータ)
+    "WIDER_train_pose_mean_v1.npy": "https://github.com/cosanlab/py-feat/raw/main/feat/resources/WIDER_train_pose_mean_v1.npy"
 }
 
 def download_file(filename, url):
     path = os.path.join(MODEL_DIR, filename)
+    # サイズチェックを行い、空ファイルや極小ファイルなら再ダウンロード
     if not os.path.exists(path) or os.path.getsize(path) < 1000:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
+                shutil.copyfileobj(response, out_file)
+        except Exception as e:
+            # 致命的なので停止させる
+            st.error(f"必須ファイルのダウンロードに失敗しました: {filename}\n{e}")
+            st.stop()
 
-# 設定ファイル生成 (AUとFacePoseを偽装設定する)
+# 設定ファイル生成 (AU/Poseのダミー設定込み)
 def create_model_config():
     config_path = os.path.join(MODEL_DIR, 'model_list.json')
-    # 既存のファイルを指すようにしてファイル存在チェックをパスさせる
-    dummy_file = "mobilenet0.25_Final.pth" 
+    dummy_file = "mobilenet0.25_Final.pth"
     
     config_data = {
         "face_detectors": {
@@ -67,83 +79,84 @@ def create_model_config():
             }
         },
         "au_detectors": {
-            # "xgb" を指定されたら、とりあえず存在するファイルを指しておく
-            "xgb": {
-                "file": dummy_file, 
-                "urls": [],
-                "sha256": "skip"
-            }
+            "xgb": {"file": dummy_file, "urls": [], "sha256": "skip"}
         },
         "facepose_detectors": {
-            # "img2pose" も同様
-            "img2pose": {
-                "file": dummy_file,
-                "urls": [],
-                "sha256": "skip"
-            }
+            "img2pose": {"file": dummy_file, "urls": [], "sha256": "skip"}
         }
     }
     with open(config_path, 'w') as f:
         json.dump(config_data, f)
 
 # ==========================================
-# 3. Detector ローダー (Import Delay & Class Mocking)
+# 3. Detector ローダー (The Final Fix)
 # ==========================================
 
 @st.cache_resource
 def load_detector_safe():
     st.info("モデル環境を構築中...")
     
-    # A. ダウンロード & 設定ファイル生成
+    # 1. 全ファイルのダウンロード
     for fname, url in MODEL_URLS.items():
         download_file(fname, url)
     create_model_config()
     
-    # B. パッチ関数定義
+    # 2. パス関数のパッチ
     def patched_get_resource_path():
         return MODEL_DIR
     
-    # C. インポート
+    # 3. インポート
     import feat
     import feat.utils
     import feat.pretrained
-    import feat.detector # ここで Detector クラスなどが読み込まれる
+    import feat.detector
     
-    # D. パス書き換え (get_resource_path)
+    # 4. パス書き換え適用
     feat.utils.get_resource_path = patched_get_resource_path
     feat.pretrained.get_resource_path = patched_get_resource_path
     for module_name, module in list(sys.modules.items()):
         if module_name.startswith('feat') and hasattr(module, 'get_resource_path'):
             module.get_resource_path = patched_get_resource_path
 
-    # E. クラスの無効化 (Mocking)
-    # AUとFacePoseは、クラスの初期化時にファイルをロードしようとするので、
-    # クラスそのものを「何もしないダミークラス」に差し替えます。
-    
+    # 5. クラス無効化 (Mocking)
     class MockDetectorPart:
-        def __init__(self, *args, **kwargs):
-            # 初期化時は何もしない（ファイルのロードを回避）
-            pass
-        def detect(self, *args, **kwargs):
-            # 検出時はNoneを返すか、空の結果を返す
-            return None
+        def __init__(self, *args, **kwargs): pass
+        def detect(self, *args, **kwargs): return None
             
-    # ライブラリ内のクラス定義を上書き
     feat.detector.AUDetector = MockDetectorPart
     feat.detector.FacePoseDetector = MockDetectorPart
     
-    # F. 初期化
-    from feat import Detector
+    # 6. 【ここが今回の肝】 numpy.load のハイジャック
+    # ライブラリがハードコードされたパスで .npy ファイルを読もうとしたとき、
+    # 強制的に model_weights 内のファイルを読ませる
     
-    # バリデーションを通過させるために、有効な名前("xgb", "img2pose")を指定する。
-    # ただし、上のMock化により、実際にロードは行われません。
-    detector = Detector(
-        face_model="retinaface",
-        landmark_model="pfld",
-        emotion_model="resmasknet",
-        au_model="xgb",         # Noneだとエラーになるので有効な名前を指定
-        facepose_model="img2pose" # 同上
-    )
+    original_np_load = np.load
+    
+    def patched_np_load(file, *args, **kwargs):
+        # ファイルパスが文字列で、かつ問題のファイル名が含まれている場合
+        if isinstance(file, str) and "WIDER_train_pose_mean_v1.npy" in file:
+            # 強制的にローカルのパスに差し替え
+            new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
+            return original_np_load(new_path, *args, **kwargs)
+        return original_np_load(file, *args, **kwargs)
+    
+    # パッチ適用
+    np.load = patched_np_load
+    
+    try:
+        from feat import Detector
+        # Detector初期化
+        detector = Detector(
+            face_model="retinaface",
+            landmark_model="pfld",
+            emotion_model="resmasknet",
+            au_model="xgb",
+            facepose_model="img2pose"
+        )
+    finally:
+        # パッチ解除（他の処理に影響しないように戻す）
+        np.load = original_np_load
+        
     return detector
 
 # ==========================================
