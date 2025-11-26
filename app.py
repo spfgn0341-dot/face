@@ -4,16 +4,24 @@ import numpy as np
 import os
 import shutil
 import scipy.stats
+import scipy.integrate  # 追加: 積分モジュールのインポート
 
 # ==========================================
-# 0. 初期設定とパッチ処理
+# 0. 初期設定とパッチ処理 (最優先実行)
 # ==========================================
 
 # ------------------------------------------
-# A. Scipyエラー回避 (最新版でも念のため残す)
+# A. Scipyエラー回避 (binom_test & simps)
 # ------------------------------------------
+
+# 1. binom_test のパッチ (scipy 1.12+ 対策)
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
+
+# 2. simps のパッチ (scipy 1.13+ 対策: 今回のエラー原因)
+#    py-feat が古い simps を呼ぼうとするので、新しい simpson に置き換える
+if not hasattr(scipy.integrate, 'simps'):
+    scipy.integrate.simps = scipy.integrate.simpson
 
 # ------------------------------------------
 # B. モデル保存先と設定ファイルの修復
@@ -27,12 +35,11 @@ writable_dir = os.path.join(os.getcwd(), 'model_weights')
 os.makedirs(writable_dir, exist_ok=True)
 
 # 2. model_list.json をローカルにコピーする
-#    (最新版の py-feat から正しいURLリストを持ってくるため、必ずコピー/上書きする)
 original_feat_dir = os.path.dirname(feat.__file__)
-# バージョンによって resources フォルダの位置が微妙に違う可能性があるため探索
+# リソースフォルダの場所を探す
 possible_resource_dirs = [
     os.path.join(original_feat_dir, 'resources'),
-    os.path.join(original_feat_dir, '..', 'resources'), # 一つ上の場合
+    os.path.join(original_feat_dir, '..', 'resources'),
 ]
 
 src_json_path = None
@@ -43,7 +50,7 @@ for p in possible_resource_dirs:
 
 if src_json_path:
     dst_json_path = os.path.join(writable_dir, 'model_list.json')
-    # 常に上書きコピー（古い情報が残らないようにする）
+    # 常に上書きコピー（古い情報が残らないように）
     shutil.copy(src_json_path, dst_json_path)
 
 # 3. パッチ適用: 保存先をローカルに向ける
@@ -62,24 +69,20 @@ from PIL import Image
 
 @st.cache_resource
 def load_detector():
-    # 最新版 py-feat ではデフォルトモデルの構成が変わっている可能性がありますが
-    # 引数なし(Detector())なら推奨設定が読み込まれます。
     return Detector()
 
 def annotate_image(img_array, results):
     img = img_array.copy()
-    # py-featの結果カラム名（基本の感情7種）
     emotion_cols = ['anger', 'disgust', 'fear', 'happiness', 'sadness', 'surprise', 'neutral']
 
     for index, row in results.iterrows():
-        # カラム名の揺らぎを吸収（バージョンによって異なる場合があるため）
+        # カラム名の揺らぎ吸収
         x, y, w, h = 0, 0, 0, 0
         if 'FaceRectX' in row:
             x, y, w, h = int(row['FaceRectX']), int(row['FaceRectY']), int(row['FaceRectWidth']), int(row['FaceRectHeight'])
-        elif 'face_x' in row: # 新しいバージョンの場合のカラム名対応例
+        elif 'face_x' in row: 
             x, y, w, h = int(row['face_x']), int(row['face_y']), int(row['face_width']), int(row['face_height'])
         
-        # 矩形描画（顔が見つかった場合のみ）
         if w > 0:
             cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
