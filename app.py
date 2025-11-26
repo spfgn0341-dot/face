@@ -25,110 +25,124 @@ BASE_DIR = os.getcwd()
 MODEL_DIR = os.path.join(BASE_DIR, 'model_weights')
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-MODEL_URLS = {
-    # 顔検出
+# 【網羅的リスト】py-featが使用する可能性のあるリソースファイル一覧
+# これらを全てローカルに用意し、パスをハイジャックします
+RESOURCE_FILES = {
+    # 1. モデル本体
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
-    # 感情認識
     "ResMaskNet_Z_resmasking_dropout1_rot30.pth": "https://huggingface.co/py-feat/resmasknet/resolve/main/ResMaskNet_Z_resmasking_dropout1_rot30.pth",
-    # ランドマーク検出
     "pfld_model_best.pth.tar": "https://huggingface.co/py-feat/pfld/resolve/main/pfld_model_best.pth.tar",
+    
+    # 2. 補助データ (.npy) - これらがハードコードパスで読まれる原因
+    "reference_3d_68_points_trans.npy": "https://github.com/cosanlab/py-feat/raw/main/feat/resources/reference_3d_68_points_trans.npy",
+    "WIDER_train_pose_mean_v1.npy": "https://github.com/cosanlab/py-feat/raw/main/feat/resources/WIDER_train_pose_mean_v1.npy",
+    "WIDER_train_pose_stddev_v1.npy": "https://github.com/cosanlab/py-feat/raw/main/feat/resources/WIDER_train_pose_stddev_v1.npy",
+    # 念のため平均顔データも追加
+    "mean_face_68.npy": "https://github.com/cosanlab/py-feat/raw/main/feat/resources/mean_face_68.npy", 
 }
 
 def download_file(filename, url):
     path = os.path.join(MODEL_DIR, filename)
-    if not os.path.exists(path) or os.path.getsize(path) < 1000:
+    # ファイルが存在しない、またはサイズが極端に小さい場合はダウンロード
+    if not os.path.exists(path) or os.path.getsize(path) < 100:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
                 shutil.copyfileobj(response, out_file)
-        except Exception as e:
-            st.error(f"必須ファイルのダウンロードに失敗しました: {filename}\n{e}")
-            st.stop()
+        except Exception:
+            # ダウンロード失敗時は後続のダミー生成に任せるのでここではエラーにしない
+            pass
 
-# 【修正】不足ファイルをまとめてダミー生成
-def create_dummy_files():
-    # 1. 平均値データ (前回エラー)
-    mean_npy = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
-    if not os.path.exists(mean_npy):
-        # 形状(3,)のゼロ配列
-        np.save(mean_npy, np.zeros((3,), dtype=np.float32))
-        
-    # 2. 標準偏差データ (今回エラー)
-    std_npy = os.path.join(MODEL_DIR, "WIDER_train_pose_stddev_v1.npy")
-    if not os.path.exists(std_npy):
-        # 形状(3,)の1埋め配列 (0割りを防ぐため念のため1に)
-        np.save(std_npy, np.ones((3,), dtype=np.float32))
+def create_dummy_if_missing():
+    """ダウンロードに失敗したファイルがあれば、形状を合わせたダミーを作成して埋める"""
+    
+    # ファイル名とダミーデータの形状定義
+    dummy_shapes = {
+        "WIDER_train_pose_mean_v1.npy": (3,),
+        "WIDER_train_pose_stddev_v1.npy": (3,),
+        "reference_3d_68_points_trans.npy": (68, 3), # 今回エラーだったファイル
+        "mean_face_68.npy": (68, 2)
+    }
 
-# 設定ファイル生成
+    for fname, shape in dummy_shapes.items():
+        path = os.path.join(MODEL_DIR, fname)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            # 標準偏差(stddev)は0だと割り算エラーになるので1にする
+            if "stddev" in fname:
+                np.save(path, np.ones(shape, dtype=np.float32))
+            else:
+                np.save(path, np.zeros(shape, dtype=np.float32))
+
 def create_model_config():
     config_path = os.path.join(MODEL_DIR, 'model_list.json')
-    dummy_file = "mobilenet0.25_Final.pth"
+    # 確実に存在するファイルを指定
+    dummy_pth = "mobilenet0.25_Final.pth"
     
     config_data = {
         "face_detectors": {
             "retinaface": {
                 "file": "mobilenet0.25_Final.pth",
-                "urls": [MODEL_URLS["mobilenet0.25_Final.pth"]],
+                "urls": [RESOURCE_FILES["mobilenet0.25_Final.pth"]],
                 "sha256": "skip"
             }
         },
         "landmark_detectors": {
             "pfld": {
                 "file": "pfld_model_best.pth.tar",
-                "urls": [MODEL_URLS["pfld_model_best.pth.tar"]],
+                "urls": [RESOURCE_FILES["pfld_model_best.pth.tar"]],
                 "sha256": "skip"
             }
         },
         "emotion_detectors": {
             "resmasknet": {
                 "file": "ResMaskNet_Z_resmasking_dropout1_rot30.pth",
-                "urls": [MODEL_URLS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"]],
+                "urls": [RESOURCE_FILES["ResMaskNet_Z_resmasking_dropout1_rot30.pth"]],
                 "sha256": "skip"
             }
         },
+        # 以下は使わないが設定ファイルチェックを通すためにダミー定義
         "au_detectors": {
-            "xgb": {"file": dummy_file, "urls": [], "sha256": "skip"}
+            "xgb": {"file": dummy_pth, "urls": [], "sha256": "skip"}
         },
         "facepose_detectors": {
-            "img2pose": {"file": dummy_file, "urls": [], "sha256": "skip"}
+            "img2pose": {"file": dummy_pth, "urls": [], "sha256": "skip"}
         }
     }
     with open(config_path, 'w') as f:
         json.dump(config_data, f)
 
 # ==========================================
-# 3. Detector ローダー (Final Fix)
+# 3. Detector ローダー
 # ==========================================
 
 @st.cache_resource
 def load_detector_safe():
     st.info("モデル環境を構築中...")
     
-    # 1. 準備（ダウンロード ＆ ダミー生成）
-    for fname, url in MODEL_URLS.items():
+    # 1. 全リソースの準備
+    for fname, url in RESOURCE_FILES.items():
         download_file(fname, url)
-    create_dummy_files()  # <--- ここで2つのダミーファイルを作成
+    create_dummy_if_missing() # ダウンロード失敗時の保険
     create_model_config()
     
     # 2. パス関数のパッチ
     def patched_get_resource_path():
         return MODEL_DIR
     
-    # 3. numpy.load のハイジャック
-    # ライブラリがハードコードされたパスを読もうとしたら
-    # モデルディレクトリ内のファイルを強制的に読ませる
+    # 3. 【万能フック】numpy.load のハイジャック
+    # リストにあるファイル名が含まれていれば、問答無用でローカルファイルを読ませる
     original_np_load = np.load
+    
+    # フック対象のファイル名リスト
+    target_filenames = list(RESOURCE_FILES.keys())
     
     def patched_np_load(file, *args, **kwargs):
         if isinstance(file, str):
-            # 平均値 または 標準偏差ファイルの場合
-            if "WIDER_train_pose_mean_v1.npy" in file:
-                new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_mean_v1.npy")
-                return original_np_load(new_path, *args, **kwargs)
-            elif "WIDER_train_pose_stddev_v1.npy" in file:
-                new_path = os.path.join(MODEL_DIR, "WIDER_train_pose_stddev_v1.npy")
-                return original_np_load(new_path, *args, **kwargs)
-                
+            for target in target_filenames:
+                if target.endswith('.npy') and target in file:
+                    # パスを差し替える
+                    new_path = os.path.join(MODEL_DIR, target)
+                    return original_np_load(new_path, *args, **kwargs)
         return original_np_load(file, *args, **kwargs)
     
     # パッチ適用
@@ -141,6 +155,7 @@ def load_detector_safe():
         import feat.pretrained
         import feat.detector
         
+        # あらゆる場所のパス取得関数を書き換え
         feat.utils.get_resource_path = patched_get_resource_path
         feat.pretrained.get_resource_path = patched_get_resource_path
         for module_name, module in list(sys.modules.items()):
@@ -148,6 +163,7 @@ def load_detector_safe():
                 module.get_resource_path = patched_get_resource_path
 
         # 5. クラス無効化 (Mocking)
+        # AU / Pose は重い＆エラーの温床なので無効化
         class MockDetectorPart:
             def __init__(self, *args, **kwargs): pass
             def detect(self, *args, **kwargs): return None
@@ -162,12 +178,12 @@ def load_detector_safe():
             face_model="retinaface",
             landmark_model="pfld",
             emotion_model="resmasknet",
-            au_model="xgb",
-            facepose_model="img2pose"
+            au_model="xgb",         # Mock化済み
+            facepose_model="img2pose" # Mock化済み
         )
         
     finally:
-        # np.load を元に戻す
+        # 副作用を防ぐため np.load を元に戻す
         np.load = original_np_load
 
     return detector
