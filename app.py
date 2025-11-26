@@ -4,6 +4,7 @@ import numpy as np
 import os
 import shutil
 import urllib.request
+import sys
 import scipy.stats
 import scipy.integrate
 
@@ -17,24 +18,16 @@ if not hasattr(scipy.stats, 'binom_test'):
 if not hasattr(scipy.integrate, 'simps'):
     scipy.integrate.simps = scipy.integrate.simpson
 
-# --- B. 保存先の確保とパス書き換え ---
-import feat
-import feat.utils
-import feat.pretrained
-
+# --- B. 保存先ディレクトリの設定 ---
 # 書き込み可能なローカルディレクトリを作成
 writable_dir = os.path.join(os.getcwd(), 'model_weights')
 os.makedirs(writable_dir, exist_ok=True)
 
-# py-feat が参照するパスをローカルに向けるパッチ
+# 共通で使用するパッチ関数
 def patched_get_resource_path():
     return writable_dir
 
-feat.utils.get_resource_path = patched_get_resource_path
-feat.pretrained.get_resource_path = patched_get_resource_path
-
-# --- C. モデルファイルの強制手動ダウンロード (Hugging Face対応) ---
-# 最新の正しいURLリスト
+# --- C. モデルファイルの強制手動ダウンロード (Hugging Face) ---
 MODEL_URLS = {
     # 顔検出 (RetinaFace)
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
@@ -49,16 +42,22 @@ def download_if_missing(filename, url):
     if not os.path.exists(file_path):
         with st.spinner(f"モデルをダウンロード中: {filename} ..."):
             try:
-                # User-Agentを設定しないと拒否される場合があるため設定
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req) as response, open(file_path, 'wb') as out_file:
                     shutil.copyfileobj(response, out_file)
             except Exception as e:
-                # ダウンロード失敗時はここで明確に停止させる
-                st.error(f"モデルのダウンロードに失敗しました。\nファイル名: {filename}\nエラー: {e}")
+                st.error(f"ダウンロード失敗: {filename}\n{e}")
                 st.stop()
 
-# model_list.json のコピー処理 (設定ファイル)
+# ==========================================
+# D. インポートと強力なパッチ適用 (ここが修正の肝)
+# ==========================================
+
+import feat
+import feat.utils
+import feat.pretrained
+
+# model_list.json のコピー (設定ファイル)
 original_feat_dir = os.path.dirname(feat.__file__)
 possible_resource_dirs = [
     os.path.join(original_feat_dir, 'resources'),
@@ -75,6 +74,23 @@ if src_json_path:
     if not os.path.exists(dst_json_path):
         shutil.copy(src_json_path, dst_json_path)
 
+# 【重要】 Detectorが内部で使うモジュールを強制的にインポートし、
+# 個別に get_resource_path を書き換える
+from feat.face_detectors.Retinaface import Retinaface_test
+from feat.emo_detectors.ResMaskNet import resmasknet_test
+# バージョンによってpfldのパスが違う可能性があるためtry-catch
+try:
+    from feat.lm_detectors.pfld import pfld_inference
+    pfld_inference.get_resource_path = patched_get_resource_path
+except ImportError:
+    pass
+
+# 全方位書き換え実行
+feat.utils.get_resource_path = patched_get_resource_path
+feat.pretrained.get_resource_path = patched_get_resource_path
+Retinaface_test.get_resource_path = patched_get_resource_path # これが今回のエラーの犯人
+resmasknet_test.get_resource_path = patched_get_resource_path
+
 # ==========================================
 # アプリ本体
 # ==========================================
@@ -84,14 +100,14 @@ from PIL import Image
 
 @st.cache_resource
 def load_detector():
-    st.info("モデルファイルをチェックしています...")
+    st.info("モデルファイルを準備中...")
     
-    # 必要なモデルを順番にチェック＆ダウンロード
+    # ダウンロード実行
     download_if_missing("mobilenet0.25_Final.pth", MODEL_URLS["mobilenet0.25_Final.pth"])
     download_if_missing("ResMaskNet_Z_resmasking_dropout1_rot30.pth", MODEL_URLS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"])
     download_if_missing("pfld_model_best.pth.tar", MODEL_URLS["pfld_model_best.pth.tar"])
 
-    # 全て揃った状態でDetectorを初期化
+    # Detector初期化 (パッチ済み)
     return Detector()
 
 def annotate_image(img_array, results):
@@ -132,7 +148,6 @@ if uploaded_file is not None:
     img_array = np.array(image)
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    # Detectorロード（初回はここからダウンロード処理が走ります）
     detector = load_detector()
 
     st.write("分析中...")
