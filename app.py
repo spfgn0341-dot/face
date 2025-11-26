@@ -9,31 +9,27 @@ import scipy.stats
 import scipy.integrate
 
 # ==========================================
-# 0. 初期設定とパッチ処理 (最優先実行)
+# 0. 環境設定とパッチ (最優先)
 # ==========================================
 
-# --- A. Scipyエラー回避パッチ ---
+# --- A. Scipyバージョン対策 ---
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
 if not hasattr(scipy.integrate, 'simps'):
     scipy.integrate.simps = scipy.integrate.simpson
 
-# --- B. 保存先ディレクトリの設定 ---
-# 書き込み可能なローカルディレクトリを作成
+# --- B. 保存先ディレクトリの準備 ---
 writable_dir = os.path.join(os.getcwd(), 'model_weights')
 os.makedirs(writable_dir, exist_ok=True)
 
-# 共通で使用するパッチ関数
-def patched_get_resource_path():
-    return writable_dir
-
-# --- C. モデルファイルの強制手動ダウンロード (Hugging Face) ---
+# --- C. モデルファイルの強制手動ダウンロード ---
+# 必要最小限のモデル（顔検出、ランドマーク、感情）のみダウンロード
 MODEL_URLS = {
     # 顔検出 (RetinaFace)
     "mobilenet0.25_Final.pth": "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth",
     # 感情認識 (ResMaskNet)
     "ResMaskNet_Z_resmasking_dropout1_rot30.pth": "https://huggingface.co/py-feat/resmasknet/resolve/main/ResMaskNet_Z_resmasking_dropout1_rot30.pth",
-    # ランドマーク検出 (PFLD)
+    # ランドマーク検出 (PFLD - 感情分析の前処理で必要)
     "pfld_model_best.pth.tar": "https://huggingface.co/py-feat/pfld/resolve/main/pfld_model_best.pth.tar",
 }
 
@@ -42,73 +38,67 @@ def download_if_missing(filename, url):
     if not os.path.exists(file_path):
         with st.spinner(f"モデルをダウンロード中: {filename} ..."):
             try:
+                # User-Agent偽装（403エラー回避）
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req) as response, open(file_path, 'wb') as out_file:
                     shutil.copyfileobj(response, out_file)
             except Exception as e:
-                st.error(f"ダウンロード失敗: {filename}\n{e}")
+                st.error(f"ダウンロード失敗: {filename}\nエラー: {e}")
                 st.stop()
 
 # ==========================================
-# D. インポートと強力なパッチ適用 (ここが修正の肝)
+# D. ライブラリ読み込みと「総書き換え」
 # ==========================================
-
 import feat
-import feat.utils
-import feat.pretrained
+from feat import Detector
+from PIL import Image
 
-# model_list.json のコピー (設定ファイル)
+# 読み込まれている全てのモジュールをチェックし、パス設定関数を書き換える
+def patched_get_resource_path():
+    return writable_dir
+
+if hasattr(feat.utils, 'get_resource_path'):
+    feat.utils.get_resource_path = patched_get_resource_path
+if hasattr(feat.pretrained, 'get_resource_path'):
+    feat.pretrained.get_resource_path = patched_get_resource_path
+
+for module_name, module in list(sys.modules.items()):
+    if module_name.startswith('feat'):
+        if hasattr(module, 'get_resource_path'):
+            module.get_resource_path = patched_get_resource_path
+
+# model_list.json の救出
 original_feat_dir = os.path.dirname(feat.__file__)
-possible_resource_dirs = [
-    os.path.join(original_feat_dir, 'resources'),
-    os.path.join(original_feat_dir, '..', 'resources'),
+possible_paths = [
+    os.path.join(original_feat_dir, 'resources', 'model_list.json'),
+    os.path.join(original_feat_dir, '..', 'resources', 'model_list.json')
 ]
-src_json_path = None
-for p in possible_resource_dirs:
-    if os.path.exists(os.path.join(p, 'model_list.json')):
-        src_json_path = os.path.join(p, 'model_list.json')
+for p in possible_paths:
+    if os.path.exists(p):
+        shutil.copy(p, os.path.join(writable_dir, 'model_list.json'))
         break
-
-if src_json_path:
-    dst_json_path = os.path.join(writable_dir, 'model_list.json')
-    if not os.path.exists(dst_json_path):
-        shutil.copy(src_json_path, dst_json_path)
-
-# 【重要】 Detectorが内部で使うモジュールを強制的にインポートし、
-# 個別に get_resource_path を書き換える
-from feat.face_detectors.Retinaface import Retinaface_test
-from feat.emo_detectors.ResMaskNet import resmasknet_test
-# バージョンによってpfldのパスが違う可能性があるためtry-catch
-try:
-    from feat.lm_detectors.pfld import pfld_inference
-    pfld_inference.get_resource_path = patched_get_resource_path
-except ImportError:
-    pass
-
-# 全方位書き換え実行
-feat.utils.get_resource_path = patched_get_resource_path
-feat.pretrained.get_resource_path = patched_get_resource_path
-Retinaface_test.get_resource_path = patched_get_resource_path # これが今回のエラーの犯人
-resmasknet_test.get_resource_path = patched_get_resource_path
 
 # ==========================================
 # アプリ本体
 # ==========================================
 
-from feat import Detector
-from PIL import Image
-
 @st.cache_resource
 def load_detector():
-    st.info("モデルファイルを準備中...")
+    st.info("モデルの準備とロード中...")
     
-    # ダウンロード実行
-    download_if_missing("mobilenet0.25_Final.pth", MODEL_URLS["mobilenet0.25_Final.pth"])
-    download_if_missing("ResMaskNet_Z_resmasking_dropout1_rot30.pth", MODEL_URLS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"])
-    download_if_missing("pfld_model_best.pth.tar", MODEL_URLS["pfld_model_best.pth.tar"])
+    # 1. 必要なファイルだけダウンロード
+    for fname, url in MODEL_URLS.items():
+        download_if_missing(fname, url)
 
-    # Detector初期化 (パッチ済み)
-    return Detector()
+    # 2. Detectorの初期化
+    # 【重要】ファイルを持っていないモデル（AU, FacePose）は None にして読み込ませない
+    return Detector(
+        face_model="retinaface",
+        landmark_model="pfld",
+        emotion_model="resmasknet",
+        au_model=None,       # これを読み込むとエラーになるので無効化
+        facepose_model=None  # これも無効化
+    )
 
 def annotate_image(img_array, results):
     img = img_array.copy()
@@ -116,6 +106,7 @@ def annotate_image(img_array, results):
 
     for index, row in results.iterrows():
         x, y, w, h = 0, 0, 0, 0
+        # カラム名の違いを吸収
         if 'FaceRectX' in row:
             x, y, w, h = int(row['FaceRectX']), int(row['FaceRectY']), int(row['FaceRectWidth']), int(row['FaceRectHeight'])
         elif 'face_x' in row:
@@ -152,6 +143,7 @@ if uploaded_file is not None:
 
     st.write("分析中...")
     try:
+        # detect_image実行時も不要な検出をスキップするよう念のため指定
         result = detector.detect_image(img_bgr)
     except Exception as e:
         st.error(f"解析エラー: {e}")
@@ -161,6 +153,7 @@ if uploaded_file is not None:
         st.warning("顔が検出されませんでした。")
     else:
         st.write("解析結果データ:")
+        # 必要なカラムだけ表示（AUなどのカラムが無い場合のエラー回避）
         st.dataframe(result)
         annotated_img_bgr = annotate_image(img_bgr, result)
         annotated_img_rgb = cv2.cvtColor(annotated_img_bgr, cv2.COLOR_BGR2RGB)
