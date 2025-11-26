@@ -3,29 +3,21 @@ import cv2
 import numpy as np
 import os
 import shutil
+import urllib.request
 import scipy.stats
-import scipy.integrate  # 追加: 積分モジュールのインポート
+import scipy.integrate
 
 # ==========================================
 # 0. 初期設定とパッチ処理 (最優先実行)
 # ==========================================
 
-# ------------------------------------------
-# A. Scipyエラー回避 (binom_test & simps)
-# ------------------------------------------
-
-# 1. binom_test のパッチ (scipy 1.12+ 対策)
+# --- A. Scipyエラー回避 ---
 if not hasattr(scipy.stats, 'binom_test'):
     scipy.stats.binom_test = scipy.stats.binomtest
-
-# 2. simps のパッチ (scipy 1.13+ 対策: 今回のエラー原因)
-#    py-feat が古い simps を呼ぼうとするので、新しい simpson に置き換える
 if not hasattr(scipy.integrate, 'simps'):
     scipy.integrate.simps = scipy.integrate.simpson
 
-# ------------------------------------------
-# B. モデル保存先と設定ファイルの修復
-# ------------------------------------------
+# --- B. 保存先の確保とパス書き換え ---
 import feat
 import feat.utils
 import feat.pretrained
@@ -34,31 +26,47 @@ import feat.pretrained
 writable_dir = os.path.join(os.getcwd(), 'model_weights')
 os.makedirs(writable_dir, exist_ok=True)
 
-# 2. model_list.json をローカルにコピーする
-original_feat_dir = os.path.dirname(feat.__file__)
-# リソースフォルダの場所を探す
-possible_resource_dirs = [
-    os.path.join(original_feat_dir, 'resources'),
-    os.path.join(original_feat_dir, '..', 'resources'),
-]
-
-src_json_path = None
-for p in possible_resource_dirs:
-    if os.path.exists(os.path.join(p, 'model_list.json')):
-        src_json_path = os.path.join(p, 'model_list.json')
-        break
-
-if src_json_path:
-    dst_json_path = os.path.join(writable_dir, 'model_list.json')
-    # 常に上書きコピー（古い情報が残らないように）
-    shutil.copy(src_json_path, dst_json_path)
-
-# 3. パッチ適用: 保存先をローカルに向ける
+# 2. パッチ適用: py-feat が参照するパスをローカルに向ける
 def patched_get_resource_path():
     return writable_dir
 
 feat.utils.get_resource_path = patched_get_resource_path
 feat.pretrained.get_resource_path = patched_get_resource_path
+
+# --- C. モデルファイルの強制手動ダウンロード (今回の追加修正) ---
+# py-featの自動ダウンロードが失敗しやすいため、ここで手動で落とします。
+# 必要なモデルファイル（Face, Emotion, Landmark）のURL定義
+MODEL_URLS = {
+    "mobilenet0.25_Final.pth": "https://github.com/cosanlab/py-feat/releases/download/v0.1/mobilenet0.25_Final.pth",
+    "ResMaskNet_Z_resmasking_dropout1_rot30.pth": "https://github.com/cosanlab/py-feat/releases/download/v0.1/ResMaskNet_Z_resmasking_dropout1_rot30.pth",
+    "pfld_model_best.pth.tar": "https://github.com/cosanlab/py-feat/releases/download/v0.1/pfld_model_best.pth.tar",
+    # 必要な場合はAUモデルなども追加
+}
+
+def download_if_missing(filename, url):
+    file_path = os.path.join(writable_dir, filename)
+    if not os.path.exists(file_path):
+        try:
+            print(f"Downloading {filename}...")
+            urllib.request.urlretrieve(url, file_path)
+            print(f"Downloaded {filename}")
+        except Exception as e:
+            # エラーが出てもStreamlit上では表示しにくいのでprintのみ
+            print(f"Failed to download {filename}: {e}")
+
+# model_list.json も念のためコピー
+original_feat_dir = os.path.dirname(feat.__file__)
+possible_resource_dirs = [
+    os.path.join(original_feat_dir, 'resources'),
+    os.path.join(original_feat_dir, '..', 'resources'),
+]
+src_json_path = None
+for p in possible_resource_dirs:
+    if os.path.exists(os.path.join(p, 'model_list.json')):
+        src_json_path = os.path.join(p, 'model_list.json')
+        break
+if src_json_path:
+    shutil.copy(src_json_path, os.path.join(writable_dir, 'model_list.json'))
 
 # ==========================================
 # アプリ本体
@@ -69,6 +77,17 @@ from PIL import Image
 
 @st.cache_resource
 def load_detector():
+    # Detectorを呼ぶ前に、必要なファイルがあるか確認し、なければダウンロードする
+    st.info("モデルファイルをチェック・ダウンロード中...")
+    
+    # 1. 顔検出モデル (RetinaFace)
+    download_if_missing("mobilenet0.25_Final.pth", MODEL_URLS["mobilenet0.25_Final.pth"])
+    # 2. 感情モデル (ResMaskNet)
+    download_if_missing("ResMaskNet_Z_resmasking_dropout1_rot30.pth", MODEL_URLS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"])
+    # 3. ランドマークモデル (PFLD)
+    download_if_missing("pfld_model_best.pth.tar", MODEL_URLS["pfld_model_best.pth.tar"])
+
+    # ダウンロード完了後にロード
     return Detector()
 
 def annotate_image(img_array, results):
@@ -76,21 +95,20 @@ def annotate_image(img_array, results):
     emotion_cols = ['anger', 'disgust', 'fear', 'happiness', 'sadness', 'surprise', 'neutral']
 
     for index, row in results.iterrows():
-        # カラム名の揺らぎ吸収
         x, y, w, h = 0, 0, 0, 0
+        # バージョンによるカラム名の違いを吸収
         if 'FaceRectX' in row:
             x, y, w, h = int(row['FaceRectX']), int(row['FaceRectY']), int(row['FaceRectWidth']), int(row['FaceRectHeight'])
-        elif 'face_x' in row: 
+        elif 'face_x' in row:
             x, y, w, h = int(row['face_x']), int(row['face_y']), int(row['face_width']), int(row['face_height'])
         
         if w > 0:
             cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
+            
             emotion_texts = []
             for emo in emotion_cols:
-                if emo in row:
-                    if row[emo] > 0.05:
-                        emotion_texts.append(f"{emo}: {row[emo]:.2f}")
+                if emo in row and row[emo] > 0.05:
+                    emotion_texts.append(f"{emo}: {row[emo]:.2f}")
 
             if emotion_texts:
                 text = ", ".join(emotion_texts[:2])
@@ -111,8 +129,6 @@ if uploaded_file is not None:
     img_array = np.array(image)
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    st.info("モデルをロード・ダウンロード中...（数分かかる場合があります）")
-    
     detector = load_detector()
 
     st.write("分析中...")
