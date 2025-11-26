@@ -33,45 +33,61 @@ MODEL_URLS = {
 
 def download_file(filename, url):
     path = os.path.join(MODEL_DIR, filename)
-    # 存在確認とサイズチェック(簡易)
     if not os.path.exists(path) or os.path.getsize(path) < 1000:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
 
-# 【修正箇所】JSONのキー名を正しいもの(*_detectors)に変更
+# 設定ファイル生成 (AUとFacePoseを偽装設定する)
 def create_model_config():
     config_path = os.path.join(MODEL_DIR, 'model_list.json')
+    # 既存のファイルを指すようにしてファイル存在チェックをパスさせる
+    dummy_file = "mobilenet0.25_Final.pth" 
+    
     config_data = {
-        "face_detectors": {  # 旧: face_model (これだとエラーになる)
+        "face_detectors": {
             "retinaface": {
                 "file": "mobilenet0.25_Final.pth",
                 "urls": [MODEL_URLS["mobilenet0.25_Final.pth"]],
                 "sha256": "skip"
             }
         },
-        "landmark_detectors": { # 旧: landmark_model
+        "landmark_detectors": {
             "pfld": {
                 "file": "pfld_model_best.pth.tar",
                 "urls": [MODEL_URLS["pfld_model_best.pth.tar"]],
                 "sha256": "skip"
             }
         },
-        "emotion_detectors": { # 旧: emotion_model
+        "emotion_detectors": {
             "resmasknet": {
                 "file": "ResMaskNet_Z_resmasking_dropout1_rot30.pth",
                 "urls": [MODEL_URLS["ResMaskNet_Z_resmasking_dropout1_rot30.pth"]],
                 "sha256": "skip"
             }
         },
-        "au_detectors": {},       # 旧: au_model
-        "facepose_detectors": {}  # 旧: facepose_model
+        "au_detectors": {
+            # "xgb" を指定されたら、とりあえず存在するファイルを指しておく
+            "xgb": {
+                "file": dummy_file, 
+                "urls": [],
+                "sha256": "skip"
+            }
+        },
+        "facepose_detectors": {
+            # "img2pose" も同様
+            "img2pose": {
+                "file": dummy_file,
+                "urls": [],
+                "sha256": "skip"
+            }
+        }
     }
     with open(config_path, 'w') as f:
         json.dump(config_data, f)
 
 # ==========================================
-# 3. Detector ローダー (Import Delay Strategy)
+# 3. Detector ローダー (Import Delay & Class Mocking)
 # ==========================================
 
 @st.cache_resource
@@ -87,29 +103,46 @@ def load_detector_safe():
     def patched_get_resource_path():
         return MODEL_DIR
     
-    # C. インポート (ここで初めて行う)
+    # C. インポート
     import feat
     import feat.utils
     import feat.pretrained
+    import feat.detector # ここで Detector クラスなどが読み込まれる
     
-    # D. パス書き換え
+    # D. パス書き換え (get_resource_path)
     feat.utils.get_resource_path = patched_get_resource_path
     feat.pretrained.get_resource_path = patched_get_resource_path
-    
-    # sys.modules も念のため書き換え
     for module_name, module in list(sys.modules.items()):
         if module_name.startswith('feat') and hasattr(module, 'get_resource_path'):
             module.get_resource_path = patched_get_resource_path
 
-    # E. 初期化
+    # E. クラスの無効化 (Mocking)
+    # AUとFacePoseは、クラスの初期化時にファイルをロードしようとするので、
+    # クラスそのものを「何もしないダミークラス」に差し替えます。
+    
+    class MockDetectorPart:
+        def __init__(self, *args, **kwargs):
+            # 初期化時は何もしない（ファイルのロードを回避）
+            pass
+        def detect(self, *args, **kwargs):
+            # 検出時はNoneを返すか、空の結果を返す
+            return None
+            
+    # ライブラリ内のクラス定義を上書き
+    feat.detector.AUDetector = MockDetectorPart
+    feat.detector.FacePoseDetector = MockDetectorPart
+    
+    # F. 初期化
     from feat import Detector
     
+    # バリデーションを通過させるために、有効な名前("xgb", "img2pose")を指定する。
+    # ただし、上のMock化により、実際にロードは行われません。
     detector = Detector(
         face_model="retinaface",
         landmark_model="pfld",
         emotion_model="resmasknet",
-        au_model=None,
-        facepose_model=None
+        au_model="xgb",         # Noneだとエラーになるので有効な名前を指定
+        facepose_model="img2pose" # 同上
     )
     return detector
 
@@ -157,7 +190,6 @@ if uploaded_file is not None:
     try:
         detector = load_detector_safe()
     except Exception as e:
-        # エラーの詳細を表示してデバッグしやすくする
         st.error(f"モデルのロードに失敗しました。\n詳細: {e}")
         st.stop()
 
